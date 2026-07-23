@@ -102,6 +102,9 @@ let rafId = 0;
 let acc = 0;
 let last = 0;
 let frameCb = null;
+// Touch contacts tracked from canvas pointer events (logical coords).
+let activeTouches = []; // [{id, x, y}]
+let touchReleasePending = false;
 // Virtual clock policy (docs/DETERMINISM.md): virtual frames per second. One
 // frame(buttons) transaction + 60/simHz core ticks per virtual frame, so
 // ms-based animations cover the same VIRTUAL time at every rate. ?hz=2
@@ -181,7 +184,7 @@ function devtoolsScreenshot() {
   shot.height = FB_H;
   const sctx = shot.getContext("2d");
   const img = sctx.createImageData(FB_W, FB_H);
-  img.data.set(wasm.renderScaled(RENDER_SCALE));
+  img.data.set(RENDER_SCALE === 1 ? wasm.render() : wasm.renderScaled(RENDER_SCALE));
   sctx.putImageData(img, 0, 0);
   const frame = globalThis.__pocketDevtools ? globalThis.__pocketDevtools.frame : 0;
   dtSend(JSON.stringify({ t: "screenshot", frame, data: shot.toDataURL("image/png") }));
@@ -212,7 +215,11 @@ function safeFrame() {
   if (!frameCb) return;
   try {
     // JS: one virtual-frame transaction (input, effects, sweep)
-    frameCb(held, packedAnalog());
+    const packed = activeTouches.length > 0
+      ? activeTouches.map((t) => (((t.id & 0xff) << 20) | ((t.y & 0x3ff) << 10) | (t.x & 0x3ff)) >>> 0)
+      : undefined;
+    frameCb(held, packedAnalog(), packed);
+    if (touchReleasePending) { activeTouches = []; touchReleasePending = false; }
     const ticks = 60 / simHz;
     for (let t = 0; t < ticks; t++) wasm.tick(); // core catch-up: 1/60 s each
   } catch (e) {
@@ -319,7 +326,37 @@ export async function mount(theCanvas, opts = {}) {
   window.addEventListener("blur", () => {
     held = 0;
     nubHeld.clear();
+    activeTouches = [];
   });
+  // Canvas pointer → touch contacts (logical coords).
+  const toLogical = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.round((e.clientX - rect.left) * (LOGICAL_W / rect.width)),
+      y: Math.round((e.clientY - rect.top) * (LOGICAL_H / rect.height)),
+    };
+  };
+  canvas.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    const { x, y } = toLogical(e);
+    activeTouches = [{ id: 1, x, y }];
+    globalThis.__pocketTouch = { x, y, phase: "down" };
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (activeTouches.length === 0) return;
+    const { x, y } = toLogical(e);
+    activeTouches = [{ id: 1, x, y }];
+    globalThis.__pocketTouch = { x, y, phase: "move" };
+  });
+  // Deferred release: keep touch alive for at least one frame so the
+  // gesture system always sees down then up (fixes sub-frame clicks).
+  const markRelease = () => {
+    touchReleasePending = true;
+    if (globalThis.__pocketTouch) globalThis.__pocketTouch.phase = "up";
+  };
+  canvas.addEventListener("pointerup", markRelease);
+  canvas.addEventListener("pointercancel", markRelease);
+  canvas.addEventListener("lostpointercapture", markRelease);
   const hzParam = Number(query.get("hz"));
   if (VALID_HZ.includes(hzParam)) simHz = hzParam;
   const res = await fetch("pocketjs.wasm");

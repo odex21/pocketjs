@@ -11,7 +11,7 @@ export interface TouchContact {
   readonly y: number;
 }
 
-const COORD_BITS = 9;
+const COORD_BITS = 10;
 const COORD_MASK = (1 << COORD_BITS) - 1;
 const ID_SHIFT = COORD_BITS * 2;
 const EMPTY: readonly TouchContact[] = Object.freeze([]);

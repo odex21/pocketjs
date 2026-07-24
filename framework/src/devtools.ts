@@ -174,13 +174,26 @@ export function initDevtools(ops: HostOps): void {
 
 /** Wrap the composed frame handler (render()'s input+hooks+sweep closure). */
 export function wrapFrameHandler(
-  h: (buttons: number, analog: number, touches?: readonly number[], hits?: readonly number[]) => void,
-): (buttons: number, analog?: number, touches?: readonly number[], hits?: readonly number[]) => void {
+  h: (
+    buttons: number,
+    analog: number,
+    touches?: readonly number[],
+    hits?: readonly number[],
+    touchEvents?: readonly number[],
+  ) => void,
+): (
+  buttons: number,
+  analog?: number,
+  touches?: readonly number[],
+  hits?: readonly number[],
+  touchEvents?: readonly number[],
+) => void {
   return (
     buttons: number,
     analogArg?: number,
     touchArg?: readonly number[],
     hitsArg?: readonly number[],
+    touchEventArg?: readonly number[],
   ) => {
     state.hostCalls++;
     if (state.transport) {
@@ -191,6 +204,7 @@ export function wrapFrameHandler(
     let analog = analogArg === undefined ? ANALOG_CENTER : analogArg & 0xffff;
     let touch = touchArg;
     let hits = hitsArg;
+    let touchEvents = touchEventArg;
     if (state.replayMasks) {
       if (state.replayAt < state.replayMasks.length) {
         mask = state.replayMasks[state.replayAt];
@@ -205,6 +219,7 @@ export function wrapFrameHandler(
         // (op 42/27 against the same committed layout — the same answer the
         // recording host computed).
         hits = undefined;
+        touchEvents = undefined;
         state.replayAt++;
       } else {
         state.replayMasks = null; // tape exhausted: back to live input
@@ -221,7 +236,7 @@ export function wrapFrameHandler(
     recordMask(mask, analog, touch);
     state.frame++;
     try {
-      h(mask, analog, touch, hits);
+      h(mask, analog, touch, hits, touchEvents);
     } catch (e) {
       send({
         t: "error",

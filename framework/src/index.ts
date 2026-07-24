@@ -45,6 +45,7 @@ import { __runGestures, resetGestures } from "./gesture.ts";
 import { installTouchActivation } from "./touch-activation.ts";
 import { __setAnalog, resetFrameHooks, runFrameHooks } from "./frame.ts";
 import { __resetTouches, __setTouches } from "./touch.ts";
+import { handleTouchSamples, resetTouchEvents, setTouchHitRootProvider } from "./touch-events.ts";
 import { __advanceClock, resetClock } from "./clock.ts";
 import { __drainEffects, resetEffects } from "./effects.ts";
 import { entries as pakEntries, get as pakGet, hasPack, loadPack } from "./pak.ts";
@@ -255,6 +256,7 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
 
   setInputRoot(appRoot);
   setHitRoot(rootMirror); // hit tests see the overlay layer too
+  setTouchHitRootProvider(() => rootMirror); // touch events resolve against the same tree
   resetFrameHooks();
   resetGestures();
   // The default tap->press recognizer registers FIRST: every component
@@ -265,10 +267,17 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
   initDevtools(host.ops); // DevTools shim (docs/DEVTOOLS.md): flight recorder +
   // debug channel; one branch per frame when no transport is connected.
   installFrameHandler(
-    wrapFrameHandler((buttons: number, analog: number, touches?: readonly number[], hits?: readonly number[]) => {
+    wrapFrameHandler((
+      buttons: number,
+      analog: number,
+      touches?: readonly number[],
+      hits?: readonly number[],
+      touchEvents?: readonly number[],
+    ) => {
       __advanceClock(); // virtual frame++, fire due after() timers
       __setAnalog(analog); // latch the nub before any app code reads it
       __setTouches(touches, hits); // latch contacts + their host-resolved hit facts
+      handleTouchSamples(touchEvents); // browser-aligned dispatch (W3C subset)
       __drainEffects(); // frame-boundary deliveries enter the world first
       __runGestures(); // contact lifecycles resolve before app hooks read them
       runFrameHooks(buttons); // app lifecycle callbacks: onFrame/onButtonPress/etc.
@@ -283,9 +292,11 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
     removeResizeViewportHook();
     __resetTouches();
     resetGestures();
+    resetTouchEvents(); // drop capture table (native nodes die with the tree)
     dispose(); // tears down reactivity only — universal keeps the nodes
     setInputRoot(null); // drops focus state (native focus dies with the nodes)
     setHitRoot(null);
+    setTouchHitRootProvider(null);
     setOverlayRoot(null);
     appLayer = null;
     overlayLayer = null;

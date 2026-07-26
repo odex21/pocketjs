@@ -76,12 +76,12 @@ describe("Vue Vapor guest DOM", () => {
       };
     };
     const template = pocketDocument.createElement("template");
-    template.innerHTML = "<!-- karaoke overlay -->";
+    template.innerHTML = "<!-- comment -->";
 
     const node = template.content.firstChild;
     expect(node).not.toBeNull();
     expect(node!.domNodeType).toBe(8);
-    expect(node!.domData).toBe(" karaoke overlay ");
+    expect(node!.domData).toBe(" comment ");
     expect(node!.text).toBe("");
   });
 });

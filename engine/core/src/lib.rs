@@ -84,7 +84,7 @@ impl Texture {
     /// The 1024-byte CLUT (256 x u32 ABGR); Some only when psm == PSM_T8.
     pub fn palette(&self) -> Option<&[u8]> {
         // Safe: the palette Vec<u128> is always TEX_PALETTE_BYTES/16 chunks
-        // (constructed only by copy_aligned(_, TEX_PALETTE_BYTES)).
+        // (constructed only by try_copy_aligned(_, TEX_PALETTE_BYTES)).
         self.palette
             .as_ref()
             .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const u8, TEX_PALETTE_BYTES) })
@@ -173,14 +173,25 @@ pub(crate) fn tex_alloc(slots: &mut Vec<TexSlot>, free: &mut Vec<u32>, tex: Text
     make_tex_handle(s.gen, slot)
 }
 
+/// Zeroed Vec of `len` u128 chunks, or None when the allocation fails —
+/// texture upload must degrade to a "-1/false" answer, never trip a host
+/// alloc-error abort (ESP32's handler reboots the chip).
+fn try_zeroed_chunks(len: usize) -> Option<Vec<u128>> {
+    let mut chunks: Vec<u128> = Vec::new();
+    chunks.try_reserve_exact(len).ok()?;
+    chunks.resize(len, 0);
+    Some(chunks)
+}
+
 /// Copy `byte_len` bytes of `src` (caller guarantees `src.len() >= byte_len`)
-/// into a fresh 16-byte-aligned `u128` backing store.
-fn copy_aligned(src: &[u8], byte_len: usize) -> Vec<u128> {
-    let mut chunks = alloc::vec![0u128; byte_len.div_ceil(16)];
+/// into a fresh 16-byte-aligned `u128` backing store; None on allocation
+/// failure.
+fn try_copy_aligned(src: &[u8], byte_len: usize) -> Option<Vec<u128>> {
+    let mut chunks = try_zeroed_chunks(byte_len.div_ceil(16))?;
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), chunks.as_mut_ptr() as *mut u8, byte_len);
     }
-    chunks
+    Some(chunks)
 }
 
 // ---- unaligned LE readers (asset blob parsing; overflow-proof offsets) ------
@@ -486,32 +497,25 @@ impl Ui {
     /// stream (for PSM_T8: the index bytes AFTER the palette — the palette
     /// itself is never compressed) as PackBits-RLE, which must decode to
     /// EXACTLY w*h*bpp bytes; FLAG_LINEAR requests bilinear sampling.
+    /// Allocation failure degrades to -1 like any malformed input — hosts
+    /// whose alloc-error handler aborts (ESP32) stay up.
     pub fn upload_texture_flags(&mut self, data: &[u8], w: u32, h: u32, psm: u32, flags: u8) -> i32 {
-        let bpp = match psm {
-            spec::psm::PSM_5650 | spec::psm::PSM_4444 => 2usize,
-            spec::psm::PSM_8888 => 4usize,
-            spec::psm::PSM_T8 => 1usize,
-            _ => return -1,
-        };
-        let pow2 = |v: u32| v > 0 && v <= spec::TEX_MAX_DIM && v & (v - 1) == 0;
-        if !pow2(w) || !pow2(h) {
-            return -1;
-        }
+        let Some(byte_len) = img_byte_len(w, h, psm) else { return -1 };
         // PSM_T8 leads with the raw CLUT; the pixel stream follows it.
         let (palette, stream) = if psm == spec::psm::PSM_T8 {
             if data.len() < TEX_PALETTE_BYTES {
                 return -1;
             }
-            (Some(copy_aligned(data, TEX_PALETTE_BYTES)), &data[TEX_PALETTE_BYTES..])
+            let Some(palette) = try_copy_aligned(data, TEX_PALETTE_BYTES) else { return -1 };
+            (Some(palette), &data[TEX_PALETTE_BYTES..])
         } else {
             (None, data)
         };
-        let byte_len = w as usize * h as usize * bpp;
         let chunks = if flags & spec::img::FLAG_RLE != 0 {
             // Decode straight into the aligned backing store. The stream must
             // decode to EXACTLY byte_len bytes (codec contract) — anything
             // else is a malformed asset.
-            let mut chunks = alloc::vec![0u128; byte_len.div_ceil(16)];
+            let Some(mut chunks) = try_zeroed_chunks(byte_len.div_ceil(16)) else { return -1 };
             let dst =
                 unsafe { core::slice::from_raw_parts_mut(chunks.as_mut_ptr() as *mut u8, byte_len) };
             if !codec::packbits_decode(stream, dst) {
@@ -522,7 +526,8 @@ impl Ui {
             if stream.len() < byte_len {
                 return -1;
             }
-            copy_aligned(stream, byte_len)
+            let Some(chunks) = try_copy_aligned(stream, byte_len) else { return -1 };
+            chunks
         };
         let tex = Texture {
             data: chunks,
@@ -544,10 +549,58 @@ impl Ui {
     /// Upload a self-contained IMG pak entry (spec op uploadImgEntry;
     /// framework/compiler/pak.ts layout: u16 w, u16 h, u8 psm, u8 flags, u16 reserved,
     /// then the payload — for PSM_T8 a 1024-byte palette then the pixel
-    /// stream). Returns the texture handle, or -1 on malformed blobs.
+    /// stream). Returns the texture handle, or -1 on malformed blobs or
+    /// allocation failure.
     pub fn upload_img_entry(&mut self, blob: &[u8]) -> i32 {
         let Some((w, h, psm, flags)) = parse_img_header(blob) else { return -1 };
         self.upload_texture_flags(&blob[8..], w, h, psm, flags)
+    }
+
+    pub fn rewrite_img_entry(&mut self, handle: i32, blob: &[u8]) -> bool {
+        let Some((w, h, psm, flags)) = parse_img_header(blob) else { return false };
+        let Some(slot) = tex_resolve(&self.textures, handle) else { return false };
+        let Some(tex) = self.textures[slot as usize].tex.as_mut() else { return false };
+        if psm != tex.psm {
+            return false;
+        }
+        let Some(byte_len) = img_byte_len(w, h, psm) else { return false };
+        if byte_len != tex.byte_len {
+            return false;
+        }
+        let mut stream = &blob[8..];
+        if psm == spec::psm::PSM_T8 {
+            if stream.len() < TEX_PALETTE_BYTES {
+                return false;
+            }
+            let Some(pal) = tex.palette.as_mut() else { return false };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    stream.as_ptr(),
+                    pal.as_mut_ptr() as *mut u8,
+                    TEX_PALETTE_BYTES,
+                );
+            }
+            stream = &stream[TEX_PALETTE_BYTES..];
+        }
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(tex.data.as_mut_ptr() as *mut u8, byte_len)
+        };
+        if flags & spec::img::FLAG_RLE != 0 {
+            if !codec::packbits_decode(stream, dst) {
+                return false;
+            }
+        } else {
+            if stream.len() < byte_len {
+                return false;
+            }
+            dst.copy_from_slice(&stream[..byte_len]);
+        }
+        tex.w = w;
+        tex.h = h;
+        tex.linear = flags & spec::img::FLAG_LINEAR != 0;
+        tex.revision = tex.revision.wrapping_add(1);
+        self.bump_raster_revision();
+        true
     }
 
     /// Decode ONE tile of a TILESET pak entry (spec op loadTileTexture; blob
@@ -562,7 +615,13 @@ impl Ui {
         // Reassemble the upload_texture_flags PSM_T8 layout (palette, then
         // pixel stream) — palette and stream live at unrelated offsets in
         // the entry.
-        let mut data = Vec::with_capacity(TEX_PALETTE_BYTES + tile.stream.len());
+        let mut data: Vec<u8> = Vec::new();
+        if data
+            .try_reserve_exact(TEX_PALETTE_BYTES + tile.stream.len())
+            .is_err()
+        {
+            return -1;
+        }
         data.extend_from_slice(tile.palette);
         data.extend_from_slice(tile.stream);
         let mut img_flags = 0u8;
@@ -1327,6 +1386,22 @@ fn parse_img_header(blob: &[u8]) -> Option<(u32, u32, u32, u8)> {
     let flags = *blob.get(5)?;
     rd_u16(blob, 6)?; // reserved — read keeps the payload offset in bounds
     Some((w, h, psm, flags))
+}
+
+/// Validated IMG geometry: psm -> bytes-per-pixel, pow2 dims within
+/// TEX_MAX_DIM; returns the decoded pixel-stream byte length.
+fn img_byte_len(w: u32, h: u32, psm: u32) -> Option<usize> {
+    let bpp = match psm {
+        spec::psm::PSM_5650 | spec::psm::PSM_4444 => 2usize,
+        spec::psm::PSM_8888 => 4usize,
+        spec::psm::PSM_T8 => 1usize,
+        _ => return None,
+    };
+    let pow2 = |v: u32| v > 0 && v <= spec::TEX_MAX_DIM && v & (v - 1) == 0;
+    if !pow2(w) || !pow2(h) {
+        return None;
+    }
+    Some(w as usize * h as usize * bpp)
 }
 
 /// One decoded pixel-stream tile of a TILESET entry (borrowed from the blob).

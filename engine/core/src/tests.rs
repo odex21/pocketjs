@@ -2308,6 +2308,89 @@ fn img_entry_uploads_v1_and_v2_blobs_and_rejects_malformed() {
     assert_eq!(ui.upload_img_entry(&bad), -1);
 }
 
+/// Raw (non-RLE) IMG entry blob: 8-byte header + verbatim pixels.
+fn raw_img_blob(w: u16, h: u16, psm: u32, pixels: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&w.to_le_bytes());
+    blob.extend_from_slice(&h.to_le_bytes());
+    blob.push(psm as u8);
+    blob.push(0);
+    blob.extend_from_slice(&[0, 0]);
+    blob.extend_from_slice(pixels);
+    blob
+}
+
+#[test]
+fn rewrite_img_entry_overwrites_pixels_in_place_keeping_handle() {
+    let mut ui = Ui::new();
+    let tex = ui.upload_img_entry(&raw_img_blob(2, 2, spec::psm::PSM_8888, &[0xcdu8; 16]));
+    assert!(tex >= 0);
+    let rev_before = ui.texture_revision(tex).unwrap();
+
+    assert!(ui.rewrite_img_entry(tex, &raw_img_blob(2, 2, spec::psm::PSM_8888, &[0x42u8; 16])));
+
+    let view = ui.texture(tex).unwrap();
+    assert_eq!(view.pixels, &[0x42u8; 16][..]);
+    assert_eq!((view.w, view.h, view.psm), (2, 2, spec::psm::PSM_8888));
+    assert!(
+        ui.texture_revision(tex).unwrap() > rev_before,
+        "in-place overwrite must bump the content revision"
+    );
+}
+
+#[test]
+fn rewrite_img_entry_rejects_mismatches_without_touching_pixels() {
+    let mut ui = Ui::new();
+    let tex = ui.upload_img_entry(&raw_img_blob(2, 2, spec::psm::PSM_5650, &[0x11u8; 8]));
+    assert!(tex >= 0);
+
+    // Bigger dims decode to a different byte_len.
+    assert!(!ui.rewrite_img_entry(tex, &raw_img_blob(4, 4, spec::psm::PSM_5650, &[0x22u8; 32])));
+    // Different psm (8888 2x2 = 16 bytes vs the slot's 8).
+    assert!(!ui.rewrite_img_entry(tex, &raw_img_blob(2, 2, spec::psm::PSM_8888, &[0x33u8; 16])));
+    // Malformed: short header, truncated pixel stream.
+    let blob = raw_img_blob(2, 2, spec::psm::PSM_5650, &[0x44u8; 8]);
+    assert!(!ui.rewrite_img_entry(tex, &blob[..7]));
+    assert!(!ui.rewrite_img_entry(tex, &blob[..15]));
+    // Unknown handle.
+    assert!(!ui.rewrite_img_entry(999, &blob));
+
+    assert_eq!(
+        ui.texture(tex).unwrap().pixels,
+        &[0x11u8; 8][..],
+        "rejected rewrites must leave the live pixels untouched"
+    );
+
+    // Stale handle after free.
+    ui.free_texture(tex);
+    assert!(!ui.rewrite_img_entry(tex, &blob));
+}
+
+#[test]
+fn rewrite_img_entry_decodes_rle_and_updates_t8_palette_in_place() {
+    let mut ui = Ui::new();
+    // T8 upload: zeroed palette + raw index stream [7; 16].
+    let mut up = raw_img_blob(4, 4, spec::psm::PSM_T8, &[]);
+    up.extend_from_slice(&[0u8; 1024]);
+    up.extend_from_slice(&[7u8; 16]);
+    let tex = ui.upload_img_entry(&up);
+    assert!(tex >= 0);
+
+    // Rewrite: new palette (first byte 9) + RLE stream (run of 16 x index 3).
+    let mut next = raw_img_blob(4, 4, spec::psm::PSM_T8, &[]);
+    next[5] = spec::img::FLAG_RLE;
+    next.extend_from_slice(&[9u8; 1024]);
+    next.extend_from_slice(&[142, 3]);
+    assert!(ui.rewrite_img_entry(tex, &next));
+
+    let view = ui.texture(tex).unwrap();
+    assert_eq!(view.pixels, &[3u8; 16][..]);
+    assert_eq!(view.palette.unwrap()[0], 9);
+
+    // Truncated RLE stream (must decode to EXACTLY w*h bytes) -> false.
+    assert!(!ui.rewrite_img_entry(tex, &next[..next.len() - 1]));
+}
+
 /// Build a tiny 2x2-tile TILESET blob (4x4 CLUT8 tiles, RLE + linear):
 /// tile 0 = stream of index 5, tile 1 = ABSENT, tile 2 = SOLID(index 9),
 /// tile 3 = stream of index 6.

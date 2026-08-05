@@ -140,6 +140,20 @@ trait RenderTarget {
         let len = self.pixel_len();
         self.fill_opaque(0, len, 0, 0, 0);
     }
+
+    /// esp32p4 流体背景分层合成(2026-08-05):ARGB 目标清成全透明,
+    /// 宿主 PPA 再把本层 alpha-over 到流体背景上(替代近黑 color-key,
+    /// 白色封面下不再出现大面积黑块)。默认仍清黑,仅 ARGB 目标覆盖。
+    #[inline]
+    fn clear_transparent(&mut self) {
+        self.clear_black();
+    }
+
+    /// 清透明对应的区域版本(增量渲染清损伤矩形用)。
+    #[inline]
+    fn fill_transparent(&mut self, start: usize, len: usize, r: u32, g: u32, b: u32) {
+        self.fill_opaque(start, len, r, g, b);
+    }
 }
 
 struct RgbaTarget<'a, const ARGB: bool> {
@@ -171,6 +185,16 @@ impl<const ARGB: bool> RenderTarget for RgbaTarget<'_, ARGB> {
         if a == 0 {
             return;
         }
+        /* esp32p4 分层合成:目标像素全透明时,写入 straight 色 + 覆盖率,
+           由宿主 PPA 做真正的 alpha-over(文字边缘平滑,无黑晕)。
+           目标已有内容时保持原有"按黑底混合"行为不变。 */
+        if ARGB && self.bytes[o + ai] == 0 {
+            self.bytes[o + ri] = r as u8;
+            self.bytes[o + gi] = g as u8;
+            self.bytes[o + bi] = b as u8;
+            self.bytes[o + ai] = a as u8;
+            return;
+        }
         let ia = 255 - a;
         let mix = |s: u32, d: u8| ((s * a + d as u32 * ia + 127) / 255) as u8;
         self.bytes[o + ri] = mix(r, self.bytes[o + ri]);
@@ -183,6 +207,25 @@ impl<const ARGB: bool> RenderTarget for RgbaTarget<'_, ARGB> {
     fn fill_opaque(&mut self, start: usize, len: usize, r: u32, g: u32, b: u32) {
         let byte_start = start * 4;
         fill_opaque_span::<ARGB>(&mut self.bytes[byte_start..byte_start + len * 4], r, g, b);
+    }
+
+    #[inline]
+    fn clear_transparent(&mut self) {
+        if ARGB {
+            self.bytes.fill(0);
+        } else {
+            self.clear_black();
+        }
+    }
+
+    #[inline]
+    fn fill_transparent(&mut self, start: usize, len: usize, r: u32, g: u32, b: u32) {
+        if ARGB {
+            let byte_start = start * 4;
+            self.bytes[byte_start..byte_start + len * 4].fill(0);
+        } else {
+            self.fill_opaque(start, len, r, g, b);
+        }
     }
 }
 
@@ -425,7 +468,7 @@ fn render_scaled_impl<T: RenderTarget>(
 ) {
     let (width, _height, screen) = target_geometry(ui, target, scale);
     if clear {
-        target.clear_black();
+        target.clear_transparent();
     }
     render_scaled_clipped(ui, words, target, width, scale as i32, screen);
 }
@@ -542,7 +585,7 @@ fn clear_black_rect<T: RenderTarget>(target: &mut T, stride: i32, rect: Clip) {
     let row_pixels = (rect.x1 - rect.x0) as usize;
     for y in rect.y0..rect.y1 {
         let start = (y * stride + rect.x0) as usize;
-        target.fill_opaque(start, row_pixels, 0, 0, 0);
+        target.fill_transparent(start, row_pixels, 0, 0, 0);
     }
 }
 

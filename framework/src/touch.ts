@@ -22,13 +22,7 @@ const EMPTY: readonly TouchContact[] = Object.freeze([]);
 
 let snapshot: readonly TouchContact[] = EMPTY;
 
-/**
- * Internal host-frame hook.
- *
- * Existing hosts pack x:9, y:9, id:8 with bit 31 clear. Native viewports
- * wider than 512 use the append-only wide form: bit31=1, x:10, y:10, id:8.
- * Per-contact detection keeps every PSP/Vita tape and host byte-compatible.
- */
+/** Internal host-frame hook. Each u32 packs x:10, y:10, id:8. */
 export function __setTouches(packed: readonly number[] | undefined): void {
   if (!packed || packed.length === 0) {
     snapshot = EMPTY;

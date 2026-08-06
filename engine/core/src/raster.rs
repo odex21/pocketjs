@@ -186,13 +186,30 @@ impl<const ARGB: bool> RenderTarget for RgbaTarget<'_, ARGB> {
             return;
         }
         /* esp32p4 分层合成:目标像素全透明时,写入 straight 色 + 覆盖率,
-           由宿主 PPA 做真正的 alpha-over(文字边缘平滑,无黑晕)。
-           目标已有内容时保持原有"按黑底混合"行为不变。 */
+           由宿主 PPA 做真正的 alpha-over(文字边缘平滑,无黑晕)。 */
         if ARGB && self.bytes[o + ai] == 0 {
             self.bytes[o + ri] = r as u8;
             self.bytes[o + gi] = g as u8;
             self.bytes[o + bi] = b as u8;
             self.bytes[o + ai] = a as u8;
+            return;
+        }
+        if ARGB {
+            /* esp32p4 真半透明叠加(2026-08-06):目标已有内容时做真
+               straight-alpha src-over,取代 PSP 时代的"按黑底混合 +
+               alpha 强写 255"——后者在透明清屏层上会把叠在半透明底
+               (glyph 边缘/半透明 View)上的像素压平失色,流体背景上
+               文字发糊的根因。dst 不透明时数学上退化为旧行为。 */
+            let dst_a = self.bytes[o + ai] as u32;
+            let out_a = a + (dst_a * (255 - a) + 127) / 255;
+            let dst_w = dst_a * (255 - a);
+            let div = out_a * 255;
+            let half = div / 2;
+            let over = |s: u32, d: u8| ((s * a * 255 + d as u32 * dst_w + half) / div) as u8;
+            self.bytes[o + ri] = over(r, self.bytes[o + ri]);
+            self.bytes[o + gi] = over(g, self.bytes[o + gi]);
+            self.bytes[o + bi] = over(b, self.bytes[o + bi]);
+            self.bytes[o + ai] = out_a as u8;
             return;
         }
         let ia = 255 - a;
@@ -1398,6 +1415,13 @@ mod tests {
     fn argb_output_uses_le_argb8888_memory_layout() {
         let ui = Ui::new();
         let words = vec![
+            // 全屏不透明底:让两目标的每个像素都有内容,alpha 语义才一致
+            // (ARGB 透明清屏契约下,未覆盖像素 alpha=0,RGBA 清黑=255,
+            //  直接全帧比 alpha 必然误判)。
+            draw_op::RECT,
+            xy_word(0, 0),
+            wh_word(spec::SCREEN_W as u16, spec::SCREEN_H as u16),
+            0xff10_1010,
             draw_op::RECT,
             xy_word(3, 4),
             wh_word(7, 5),
